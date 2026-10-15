@@ -4,8 +4,8 @@ then check the canary and that no key without an expiry went missing.
 
     KV_REST_API_URL=... KV_REST_API_TOKEN=... python3 -u failover_test.py <cluster> <service> task-stop|process-exit
 
-task-stop      ecs stop-task (what a host failure or a deploy looks like)
-process-exit   valkey-cli SHUTDOWN NOSAVE inside the task via ECS Exec (needs session-manager-plugin on PATH); a signal
+task-stop      ecs stop-task (a graceful stop: SIGTERM, as a deploy does)
+process-exit   valkey-cli SHUTDOWN NOSAVE inside the task via ECS Exec (still flushes the append-only file: not abrupt) (needs session-manager-plugin on PATH); a signal
                sent to the container's PID 1 from inside is ignored unless the process handles it, so `kill` is not
                a crash test
 Run with python3 -u: the timeline is printed as it happens."""

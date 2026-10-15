@@ -99,7 +99,8 @@ callers (Workers, Vercel, Lambda, CI) --HTTPS--> Cloudflare edge --tunnel--> clo
    `dependsOn`, keep the health checks (every 5 s) so ECS still replaces a container that stops answering, and keep
    start periods generous: a start period only forgives early failures, and the first success ends it.
 9. **`kill 1` inside a container is not a crash test**: signals sent to PID 1 from inside its namespace are ignored
-   unless the process handles them. Use `valkey-cli SHUTDOWN NOSAVE` or stop the task.
+   unless the process handles them (`SIGKILL` included). `valkey-cli SHUTDOWN NOSAVE` or stopping the task replaces it,
+   but both flush first (see "Failover, measured" for an abrupt test).
 10. **Upstash's DUMP payloads do not restore into Valkey.** Upstash serves `DUMP` over REST, but Valkey 8.1 answered
     `RESTORE` of one with `ERR DUMP payload version or checksum are wrong`. Export by type (`scripts/backup.py`); it
     refuses to finish if a key has
@@ -133,6 +134,12 @@ Where the 74 s goes, from the task's timestamps and container logs:
 No task setting moved the two Fargate phases, and they vary between runs, so ~75 s is what one task achieved here, not
 a guarantee. Going lower needs a hot standby (a replica with its own storage and a promotion step), which is what a
 managed service sells.
+
+Neither test is abrupt: `stop-task` sends SIGTERM and `SHUTDOWN NOSAVE` still flushes the append-only file, so the
+one-second loss window of `appendfsync everysec` is untested. Testing it on Fargate needs a way to SIGKILL Valkey: a
+shared process namespace (`pidMode: task`) and `kill -9` from another container through ECS Exec, or a staging copy
+with `--enable-debug-command local` and `DEBUG SEGFAULT` (never in production: the REST front passes commands through,
+so any token holder could crash the store).
 
 The Valkey process exiting by itself (`valkey-cli SHUTDOWN NOSAVE` through ECS Exec) also replaced the task with the
 canary intact; that run's timing was not captured.
