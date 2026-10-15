@@ -43,6 +43,9 @@ def main():
             for entry in v:
                 entry_id, fields = d(entry[0]), [d(x) for x in entry[1]]
                 cmds.append(["XADD", k, entry_id] + fields)
+            # Each consumer group at its recorded cursor, so consumers neither fail with NOGROUP nor skip or replay.
+            for g in e.get("groups", []):
+                cmds.append(["XGROUP", "CREATE", k, g["name"], g["last_delivered_id"], "MKSTREAM"])
         if remaining is not None:
             cmds.append(["PEXPIRE", k, str(remaining)])
     for i in range(0, len(cmds), 300):

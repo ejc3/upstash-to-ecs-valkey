@@ -28,11 +28,12 @@ Workload used for the prices: about **1 million commands a month** (mostly a one
 |---|---|---|---|---|---|
 | **Upstash free** | $0 | managed | yes (HTTPS) | none | 10 MB |
 | | ✗ 500k commands/month cap: this workload is ~2× over | | | | |
-| **Upstash pay-as-you-go** | **~$2** ($0.20 per 100k commands; storage and bandwidth within allowance) | managed, replicated | yes | none | 10 MB (50 MB is $80/month) |
+| **Upstash pay-as-you-go** | **~$2** ($0.20 per 100k commands; storage and bandwidth within allowance) | managed, replicated | yes | none | 10 MB (20 MB from the $100/month Fixed 5 GB plan, 50 MB at $400/month) |
 | **Upstash via AWS Marketplace** | same usage billed on the AWS invoice | managed | yes | none (one console subscription to link accounts) | 10 MB |
-| **ElastiCache (Valkey)** | ~$12 (cache.t4g.micro) or ~$6+ serverless minimum (estimate), **plus** a proxy | managed Multi-AZ | **no**: VPC only, so you still need serverless-redis-http and a tunnel in front | the proxy is yours | proxy's |
+| **ElastiCache (Valkey), one node** | ~$12 (cache.t4g.micro), **plus** a proxy | none automatic: no replica to fail over to | **no**: VPC only, so you still need serverless-redis-http and a tunnel in front | the proxy is yours | proxy's |
+| **ElastiCache (Valkey), Multi-AZ** | ~$24 (primary and a replica in another zone), **plus** a proxy | managed automatic failover | same | the proxy is yours | proxy's |
 | **One EC2 instance** (t4g.micro, Docker) | ~$11 | none: down until restarted | via a tunnel | OS, images, patches | 64 MB (patched) |
-| **ECS Fargate + EFS** (this repo) | **~$21–25** (0.5 vCPU / 1 GB ARM task $16.60, public IPv4 $3.65, EFS cents, logs and Container Insights a few dollars) | automatic task replacement, **~75 s** measured, any zone | via a tunnel | images (built by a job), no hosts | 64 MB (patched) |
+| **ECS Fargate + EFS** (this repo) | **~$21–25** (0.5 vCPU / 1 GB ARM task $16.60, public IPv4 $3.65, EFS cents, logs and Container Insights a few dollars) | automatic task replacement, any zone; **74 s** measured for a stopped task | via a tunnel | images (built by a job), no hosts | 64 MB (patched) |
 
 Latency, measured from an EC2 instance in us-west-1 (PING + GET of a 260 KB key, 20 runs):
 
@@ -46,7 +47,8 @@ migration saw.
 
 **Choosing.** If you just want it to work: Upstash pay-as-you-go, ideally in your callers' region. It is cheaper,
 managed and replicated. Self-host when you need requests above 10 MB, want the data in your own account, or want to
-reuse the cluster for other services, and accept one node, a ~75 s failover and owning the images.
+reuse the cluster for other services, and accept one copy of the data (up to about a second of writes lost if the
+process dies abruptly), a gap of a minute or more on a failure or deploy, and owning the images.
 
 ## Architecture
 
@@ -57,7 +59,9 @@ callers (Workers, Vercel, Lambda, CI) --HTTPS--> Cloudflare edge --tunnel--> clo
 ```
 
 - **One task, one Valkey node.** Its append-only file (`appendfsync everysec`) lives on EFS, which is replicated across
-  zones, so a replacement task in any zone has the data. There is no hot standby: two Valkeys on one append-only file
+  zones, so a replacement task in any zone has the data. A graceful stop flushes it and loses nothing acknowledged; an
+  abrupt failure (no SIGTERM) can lose about the last second of acknowledged writes. Use `appendfsync always` or a
+  replicated store if that is not acceptable. There is no hot standby: two Valkeys on one append-only file
   would corrupt it, so the service never runs two copies (`deployment_minimum_healthy_percent = 0`, maximum 100).
 - **No inbound rule.** cloudflared dials out; the REST bearer token is the credential, exactly as with Upstash.
 - **Images come from a private ECR**, mirrored or built once by a CodeBuild job, never pulled from Docker Hub at start.
@@ -97,11 +101,15 @@ callers (Workers, Vercel, Lambda, CI) --HTTPS--> Cloudflare edge --tunnel--> clo
 9. **`kill 1` inside a container is not a crash test**: signals sent to PID 1 from inside its namespace are ignored
    unless the process handles them. Use `valkey-cli SHUTDOWN NOSAVE` or stop the task.
 10. **DUMP is not served over Upstash REST.** Export by type (`scripts/backup.py`); it refuses to finish if a key has
-    a type it cannot export. Stream consumer groups and pending entries are not exported: drain them first.
+    a type it cannot export. For streams it also records each consumer group's last-delivered ID, and
+    `scripts/restore.py` recreates the group there (tested: a group that had read two of three entries reads only the
+    third after the restore). Pending entries cannot be carried over REST: pause consumers and let them process or
+    claim what is pending first; never `XACK` just to empty the list.
 
 ## Failover, measured
 
-Each run: write a canary, stop the running task (`ecs stop-task`, which is what a host failure or a deploy looks like),
+Each run: write a canary, stop the running task (`ecs stop-task`: a graceful stop, as a deploy does; an abrupt host
+failure takes the same replacement path but was not timed),
 poll the public endpoint every 2 s, then check the canary and that no key without an expiry is missing
 (`scripts/failover_test.py`). Every run passed the data check; the replacement often started in another zone.
 
@@ -120,8 +128,9 @@ Where the 74 s goes, from the task's timestamps and container logs:
 | Fargate tears the old task down before the replacement is placed | 36 s | 38 s |
 | New task: network interface, image pull (107 MB), EFS mount, start | ~23 s, then ~25 s of health-gated chain | ~36 s, no chain |
 
-The rest is Fargate's own and no task setting moves it, so ~75 s is the floor for a single-task design. Going lower
-needs a hot standby (a replica with its own storage and a promotion step), which is what a managed service sells.
+No task setting moved the two Fargate phases, and they vary between runs, so ~75 s is what one task achieved here, not
+a guarantee. Going lower needs a hot standby (a replica with its own storage and a promotion step), which is what a
+managed service sells.
 
 The Valkey process exiting by itself (`valkey-cli SHUTDOWN NOSAVE` through ECS Exec) also replaced the task with the
 canary intact; that run's timing was not captured.
@@ -137,9 +146,11 @@ canary intact; that run's timing was not captured.
 4. **Final export from Upstash** (`scripts/backup.py`), after pausing scheduled writers if you can.
 5. **Apply with `running = true`**, wait for the endpoint to answer, **restore** (`scripts/restore.py`).
 6. **Switch consumers** to the new URL and token (app secrets, CI secrets, Lambdas). Do it right after the restore.
-7. **Reconcile**: export the old store again, `scripts/reconcile.py final.json after.json`, then `apply`.
-8. **Run the failover tests** (`scripts/failover_test.py <cluster> <service> task-stop`), and keep the old store until
-   the diff is empty and a day of traffic is clean.
+7. **Fence the old store**: rotate or revoke its credentials (or pause every writer), so nothing can write to it after
+   the next step. A diff taken while old writers can still write misses whatever lands after it.
+8. **Reconcile once**: export the old store again, `scripts/reconcile.py final.json after.json`, then `apply`.
+9. **Run the failover tests** (`scripts/failover_test.py <cluster> <service> task-stop`), and keep the old store,
+   read-only, until a day of traffic is clean; then delete it.
 
 All scripts read `KV_REST_API_URL` and `KV_REST_API_TOKEN` from the environment (never a command line), and write
 backups with mode 0600.
