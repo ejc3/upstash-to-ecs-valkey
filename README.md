@@ -100,7 +100,9 @@ callers (Workers, Vercel, Lambda, CI) --HTTPS--> Cloudflare edge --tunnel--> clo
    start periods generous: a start period only forgives early failures, and the first success ends it.
 9. **`kill 1` inside a container is not a crash test**: signals sent to PID 1 from inside its namespace are ignored
    unless the process handles them. Use `valkey-cli SHUTDOWN NOSAVE` or stop the task.
-10. **DUMP is not served over Upstash REST.** Export by type (`scripts/backup.py`); it refuses to finish if a key has
+10. **Upstash's DUMP payloads do not restore into Valkey.** Upstash serves `DUMP` over REST, but Valkey 8.1 answered
+    `RESTORE` of one with `ERR DUMP payload version or checksum are wrong`. Export by type (`scripts/backup.py`); it
+    refuses to finish if a key has
     a type it cannot export. For streams it also records each consumer group's last-delivered ID, and
     `scripts/restore.py` recreates the group there (tested: a group that had read two of three entries reads only the
     third after the restore). Pending entries cannot be carried over REST: pause consumers and let them process or

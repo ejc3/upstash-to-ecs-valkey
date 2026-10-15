@@ -3,7 +3,8 @@
 
     KV_REST_API_URL=... KV_REST_API_TOKEN=... python3 backup.py out.json
 
-DUMP is not served over REST, so each key is read with the command for its type (GET, HGETALL, SMEMBERS, LRANGE,
+Upstash serves DUMP over REST, but Valkey 8.1 rejects its payloads on RESTORE ("DUMP payload version or checksum are
+wrong"), so each key is read with the command for its type (GET, HGETALL, SMEMBERS, LRANGE,
 ZRANGE WITHSCORES, XRANGE) plus PTTL, values base64-encoded. It refuses to finish if a key has a type it cannot export.
 For a stream it also records each consumer group's name and last-delivered ID (XINFO GROUPS), which restore.py recreates.
 Pending entries (delivered, not acknowledged) cannot be exported over REST: pause the consumers and let them process or
