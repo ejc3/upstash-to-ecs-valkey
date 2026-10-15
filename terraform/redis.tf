@@ -7,10 +7,13 @@
 # are created outside this module (they are Cloudflare's); the task reads them from one Secrets Manager secret,
 # var.instance_secret_name: JSON {"tunnel_token": "...", "prod_token": "...", "stage_token": "..."}.
 #
-# Failover time (measured: task stopped -> endpoint answering, 108 s with 15 s health checks): about 40 s is Fargate
-# starting a task (placement, network interface, image pull, EFS mount), which no setting here changes; the rest is the
-# startup chain, each step waiting for the previous container's health check. Checks run every 5 s (the ECS minimum)
-# with short start periods, so each step unblocks within seconds of being ready.
+# Failover time (task stopped -> endpoint answering), measured on a production deployment: 108 s with 15 s health checks
+# and a dependsOn chain; 84 s with 5 s checks; 74 s with no dependsOn. A dependsOn chain makes Fargate stop the
+# containers in reverse order at about 12 s per step even when each exits at once (a shorter stopTimeout changes nothing),
+# and the replacement waits for the last one. Nothing needs the order: serverless-redis-http starts without Valkey,
+# answers "unable to connect" until it is up and recovers by itself after a Valkey restart; cloudflared answers 502 until
+# the REST servers listen. What remains is Fargate's own: ~38 s tearing the old task down before the replacement is
+# placed, ~36 s starting the new one (network interface, image pull, EFS mount).
 #
 # One copy only, ever: two Valkeys on one append-only file corrupt it, and two cloudflared connectors on one tunnel would
 # split writes between two stores. So the service runs one task, and a deploy stops the old task before starting the new
@@ -180,9 +183,11 @@ resource "aws_ecs_task_definition" "redis" {
       user      = "999:1000"
       command = ["valkey-server", "--dir", "/data", "--appendonly", "yes", "--appendfsync", "everysec", "--save", "900 1",
       "--maxmemory", "384mb", "--maxmemory-policy", "noeviction"]
-      mountPoints      = [{ sourceVolume = "valkey-data", containerPath = "/data" }]
-      healthCheck      = { command = ["CMD", "valkey-cli", "ping"], interval = 5, timeout = 3, retries = 2, startPeriod = 5 }
-      stopTimeout      = 10
+      mountPoints = [{ sourceVolume = "valkey-data", containerPath = "/data" }]
+      # startPeriod only forgives failures while Valkey loads its append-only file (the first success ends it).
+      healthCheck = { command = ["CMD", "valkey-cli", "ping"], interval = 5, timeout = 3, retries = 3, startPeriod = 60 }
+      # SIGTERM makes Valkey write a snapshot before it exits: give it time on EFS rather than kill it mid-save.
+      stopTimeout      = 60
       logConfiguration = local.redis_log["valkey"]
     }],
     [for env, r in local.redis_envs : {
@@ -197,10 +202,10 @@ resource "aws_ecs_task_definition" "redis" {
         { name = "SRH_PORT", value = tostring(r.port) },
         { name = "SRH_CONNECTION_STRING", value = "redis://127.0.0.1:6379/${r.db}" },
       ]
-      secrets          = [{ name = "SRH_TOKEN", valueFrom = "${data.aws_secretsmanager_secret.redis_instance.arn}:${env}_token::" }]
-      dependsOn        = [{ containerName = "valkey", condition = "HEALTHY" }]
-      healthCheck      = { command = ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:${r.port}/ || exit 1"], interval = 5, timeout = 3, retries = 2, startPeriod = 10 }
-      stopTimeout      = 10
+      secrets     = [{ name = "SRH_TOKEN", valueFrom = "${data.aws_secretsmanager_secret.redis_instance.arn}:${env}_token::" }]
+      healthCheck = { command = ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:${r.port}/ || exit 1"], interval = 5, timeout = 3, retries = 3, startPeriod = 30 }
+      # Stateless: the replacement task waits for every container of the old one to stop.
+      stopTimeout      = 2
       logConfiguration = local.redis_log["srh-${env}"]
     }],
     [{
@@ -209,8 +214,7 @@ resource "aws_ecs_task_definition" "redis" {
       essential        = true
       command          = ["tunnel", "--no-autoupdate", "run"]
       secrets          = [{ name = "TUNNEL_TOKEN", valueFrom = "${data.aws_secretsmanager_secret.redis_instance.arn}:tunnel_token::" }]
-      dependsOn        = [for env in keys(local.redis_envs) : { containerName = "srh-${env}", condition = "HEALTHY" }]
-      stopTimeout      = 10
+      stopTimeout      = 2
       logConfiguration = local.redis_log["cloudflared"]
     }],
   ))

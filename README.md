@@ -32,7 +32,7 @@ Workload used for the prices: about **1 million commands a month** (mostly a one
 | **Upstash via AWS Marketplace** | same usage billed on the AWS invoice | managed | yes | none (one console subscription to link accounts) | 10 MB |
 | **ElastiCache (Valkey)** | ~$12 (cache.t4g.micro) or ~$6+ serverless minimum (estimate), **plus** a proxy | managed Multi-AZ | **no**: VPC only, so you still need serverless-redis-http and a tunnel in front | the proxy is yours | proxy's |
 | **One EC2 instance** (t4g.micro, Docker) | ~$11 | none: down until restarted | via a tunnel | OS, images, patches | 64 MB (patched) |
-| **ECS Fargate + EFS** (this repo) | **~$21–25** (0.5 vCPU / 1 GB ARM task $16.60, public IPv4 $3.65, EFS cents, logs and Container Insights a few dollars) | automatic task replacement, **1–2 min**, any zone | via a tunnel | images (built by a job), no hosts | 64 MB (patched) |
+| **ECS Fargate + EFS** (this repo) | **~$21–25** (0.5 vCPU / 1 GB ARM task $16.60, public IPv4 $3.65, EFS cents, logs and Container Insights a few dollars) | automatic task replacement, **~75 s** measured, any zone | via a tunnel | images (built by a job), no hosts | 64 MB (patched) |
 
 Latency, measured from an EC2 instance in us-west-1 (PING + GET of a 260 KB key, 20 runs):
 
@@ -46,7 +46,7 @@ migration saw.
 
 **Choosing.** If you just want it to work: Upstash pay-as-you-go, ideally in your callers' region. It is cheaper,
 managed and replicated. Self-host when you need requests above 10 MB, want the data in your own account, or want to
-reuse the cluster for other services, and accept one node, a 1–2 minute failover and owning the images.
+reuse the cluster for other services, and accept one node, a ~75 s failover and owning the images.
 
 ## Architecture
 
@@ -86,8 +86,14 @@ callers (Workers, Vercel, Lambda, CI) --HTTPS--> Cloudflare edge --tunnel--> clo
 7. **Writes keep reaching the old store after your final backup**: the old platform keeps serving DNS-cached clients
    and in-flight jobs. Export the old store again after the switch and reconcile three-way (`scripts/reconcile.py`).
    Compare hash values, not `HGETALL` output: its field order is not stable.
-8. **Health checks are on your failover path.** Each startup step waited for the previous container's check (every 15
-   s with 30 s start periods): ~70 s of a 108 s failover. Checks every 5 s (the ECS minimum) with short start periods.
+8. **A `dependsOn` chain costs you on the way down, not just up.** With `valkey ← srh ← cloudflared` gated on
+   `HEALTHY`, startup waited for each check (every 15 s), and on stop Fargate stopped the containers in reverse order at
+   **about 12 s per step even though each exited within a second of SIGTERM**: a 2 s `stopTimeout` changed nothing.
+   The replacement task is placed only after the last container stops. Nothing needed the order: serverless-redis-http
+   starts without Valkey, answers `SRH: Unable to connect to the Redis server` until it is up, serves within a second of
+   it and recovers by itself after a Valkey restart; cloudflared answers 502 until the REST servers listen. Drop
+   `dependsOn`, keep the health checks (every 5 s) so ECS still replaces a container that stops answering, and keep
+   start periods generous: a start period only forgives early failures, and the first success ends it.
 9. **`kill 1` inside a container is not a crash test**: signals sent to PID 1 from inside its namespace are ignored
    unless the process handles them. Use `valkey-cli SHUTDOWN NOSAVE` or stop the task.
 10. **DUMP is not served over Upstash REST.** Export by type (`scripts/backup.py`); it refuses to finish if a key has
@@ -95,15 +101,30 @@ callers (Workers, Vercel, Lambda, CI) --HTTPS--> Cloudflare edge --tunnel--> clo
 
 ## Failover, measured
 
-| Test | Outage (stopped → endpoint answering) | Data |
-|---|---|---|
-| Stop the running task (15 s health checks) | **108 s**; replacement started in the other zone | canary intact, nothing missing |
-| Valkey process exits (`SHUTDOWN NOSAVE`) | task replaced by ECS | canary intact |
+Each run: write a canary, stop the running task (`ecs stop-task`, which is what a host failure or a deploy looks like),
+poll the public endpoint every 2 s, then check the canary and that no key without an expiry is missing
+(`scripts/failover_test.py`). Every run passed the data check; the replacement often started in another zone.
 
-Where the 108 s went: ~3 s ECS scheduling, ~4 s network interface, ~11 s placement, ~3 s image pull (107 MB),
-~23 s container start and EFS mount, **~70 s startup chain gated by health checks** (fixed by #8 above). Fargate's own
-~40 s is the floor for a single-task design; going lower needs a replica and a switch, which is what a managed service
-sells.
+| Configuration | Outage (stopped → endpoint answering) |
+|---|---|
+| `dependsOn` chain, health checks every 15 s, 30 s start periods | **108 s** |
+| same chain, checks every 5 s | **84 s** |
+| + 2 s stop timeout on the stateless containers | 89 s (no change: the timeout was not what was slow) |
+| **no `dependsOn`**, checks every 5 s (this repo) | **74 s** |
+
+Where the 74 s goes, from the task's timestamps and container logs:
+
+| Phase | 108 s run | 74 s run |
+|---|---|---|
+| Old task's containers stop | 25 s, one after another | **2 s**, together |
+| Fargate tears the old task down before the replacement is placed | 36 s | 38 s |
+| New task: network interface, image pull (107 MB), EFS mount, start | ~23 s, then ~25 s of health-gated chain | ~36 s, no chain |
+
+The rest is Fargate's own and no task setting moves it, so ~75 s is the floor for a single-task design. Going lower
+needs a hot standby (a replica with its own storage and a promotion step), which is what a managed service sells.
+
+The Valkey process exiting by itself (`valkey-cli SHUTDOWN NOSAVE` through ECS Exec) also replaced the task with the
+canary intact; that run's timing was not captured.
 
 ## How to do it
 
