@@ -1,0 +1,6 @@
+.terraform/
+.terraform.lock.hcl
+.build/
+__pycache__/
+*.tfstate*
+*.json.bak
